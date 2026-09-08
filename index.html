@@ -1,0 +1,293 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Gameday</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@500;600;700&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --ink:#F4F7F9;
+    --dim:#828E9B;
+    --void:#06080B;
+    --away:#1B2733;
+    --home:#1B2733;
+    --live:#3DDC84;
+  }
+  *{margin:0;padding:0;box-sizing:border-box;}
+  html{height:100%;}
+  body{
+    height:100dvh;min-height:100dvh;
+    background:var(--void);overflow:hidden;
+    font-family:"Barlow Condensed","Arial Narrow",Helvetica,sans-serif;
+    color:var(--ink);
+    -webkit-font-smoothing:antialiased;
+    font-variant-numeric:tabular-nums;
+    display:flex;flex-direction:column;
+    user-select:none;
+  }
+
+  /* ---- Score field: two color-bled halves ---- */
+  .field{
+    flex:1 1 auto;
+    display:grid;
+    grid-template-columns:1fr 1fr;
+    position:relative;
+    min-height:0;
+  }
+  .side{
+    position:relative;
+    display:flex;flex-direction:column;
+    align-items:center;justify-content:center;
+    gap:.2em;
+    transition:background 600ms ease;
+  }
+  .side.away{background:linear-gradient(180deg,var(--away) 0%,var(--void) 92%);}
+  .side.home{background:linear-gradient(180deg,var(--home) 0%,var(--void) 92%);}
+  .side.dark{filter:saturate(.35) brightness(.62);}
+
+  .crest{
+    height:clamp(34px,7vh,64px);
+    width:auto;object-fit:contain;
+    filter:drop-shadow(0 2px 6px rgba(0,0,0,.6));
+  }
+  .abbr{
+    font-size:clamp(20px,4.4vh,40px);
+    font-weight:600;letter-spacing:.06em;
+    line-height:1;
+  }
+  .record{font-size:clamp(12px,2.1vh,18px);color:var(--dim);line-height:1;}
+  .score{
+    font-size:clamp(72px,26vh,240px);
+    font-weight:700;line-height:.82;
+    letter-spacing:-.02em;
+  }
+
+  /* possession: a lit rail under the team that has the ball */
+  .rail{
+    position:absolute;left:8%;right:8%;bottom:0;height:6px;
+    border-radius:3px;background:transparent;
+    transition:background 400ms ease;
+  }
+  .rail.on{background:var(--live);box-shadow:0 0 18px var(--live);}
+
+  .divider{
+    position:absolute;top:12%;bottom:12%;left:50%;width:1px;
+    background:linear-gradient(180deg,transparent,rgba(255,255,255,.16),transparent);
+  }
+
+  /* ---- Situation band ---- */
+  .band{
+    flex:0 0 auto;
+    border-top:1px solid rgba(255,255,255,.09);
+    padding:clamp(10px,2.2vh,22px) clamp(16px,3vw,40px);
+    display:flex;flex-direction:column;gap:.35em;
+    background:#0B0F14;
+  }
+  .row{display:flex;align-items:baseline;justify-content:space-between;gap:1.5em;}
+  .situation{
+    font-size:clamp(22px,5vh,46px);font-weight:600;line-height:1;
+    white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+  }
+  .clock{
+    font-size:clamp(22px,5vh,46px);font-weight:700;line-height:1;
+    white-space:nowrap;
+  }
+  .clock .q{color:var(--dim);font-weight:500;margin-right:.35em;}
+  .lastplay{
+    font-size:clamp(14px,2.6vh,22px);color:var(--dim);font-weight:500;
+    line-height:1.25;max-height:2.5em;overflow:hidden;
+  }
+  .redzone .situation{color:#FF5A4E;}
+
+  /* ---- States ---- */
+  .msg{
+    flex:1;display:flex;flex-direction:column;
+    align-items:center;justify-content:center;gap:.5em;text-align:center;
+    padding:0 8vw;
+  }
+  .msg h1{font-size:clamp(30px,7vh,64px);font-weight:600;line-height:1.05;}
+  .msg p{font-size:clamp(16px,3vh,26px);color:var(--dim);font-weight:500;}
+
+  .pulse{
+    position:fixed;top:10px;right:12px;
+    width:8px;height:8px;border-radius:50%;
+    background:var(--dim);opacity:.5;
+  }
+  .pulse.live{background:var(--live);opacity:1;}
+  @media (prefers-reduced-motion:no-preference){
+    .pulse.live{animation:beat 2.4s ease-in-out infinite;}
+  }
+  @keyframes beat{0%,100%{opacity:1}50%{opacity:.25}}
+</style>
+</head>
+<body>
+  <div id="app"></div>
+  <div class="pulse" id="pulse"></div>
+
+<script>
+(function(){
+  "use strict";
+
+  // ---- config via URL: ?team=IND&league=football/nfl -------------------
+  var qs      = new URLSearchParams(location.search);
+  var TEAM    = (qs.get("team")   || "IND").toUpperCase();
+  var LEAGUE  = (qs.get("league") || "football/nfl").replace(/^\/|\/$/g,"");
+  var API     = "https://site.api.espn.com/apis/site/v2/sports/" + LEAGUE + "/scoreboard";
+
+  var app   = document.getElementById("app");
+  var pulse = document.getElementById("pulse");
+  var timer = null;
+
+  function esc(s){
+    return String(s == null ? "" : s).replace(/[&<>"]/g, function(c){
+      return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c];
+    });
+  }
+
+  // ESPN gives colors as bare hex, no #.
+  function lum(hex){
+    if(!hex || !/^[0-9a-f]{6}$/i.test(hex)) return -1;
+    return 0.299*parseInt(hex.slice(0,2),16) +
+           0.587*parseInt(hex.slice(2,4),16) +
+           0.114*parseInt(hex.slice(4,6),16);
+  }
+
+  // Some teams (Giants, Raiders, Sox) list black as their primary, which reads as
+  // an empty half of the screen. Swap to the alternate when the primary is too dark.
+  function field(team){
+    team = team || {};
+    var hex = team.color, L = lum(hex);
+    if(L < 45 && lum(team.alternateColor) > L) hex = team.alternateColor;
+    if(lum(hex) < 0) return "#1B2733";
+    var k = 0.34;
+    return "rgb(" + Math.round(parseInt(hex.slice(0,2),16)*k) + "," +
+                    Math.round(parseInt(hex.slice(2,4),16)*k) + "," +
+                    Math.round(parseInt(hex.slice(4,6),16)*k) + ")";
+  }
+
+  function pickGame(events){
+    if(!Array.isArray(events)) return null;
+    var live = null, next = null, done = null;
+    for(var i=0;i<events.length;i++){
+      var ev = events[i];
+      var comp = ev.competitions && ev.competitions[0];
+      if(!comp || !comp.competitors) continue;
+      var mine = comp.competitors.some(function(c){
+        return c.team && String(c.team.abbreviation||"").toUpperCase() === TEAM;
+      });
+      if(!mine) continue;
+      var state = ev.status && ev.status.type && ev.status.type.state;
+      if(state === "in")   { live = ev; break; }
+      if(state === "pre")  { if(!next) next = ev; }
+      if(state === "post") { done = ev; }
+    }
+    return live || next || done;
+  }
+
+  function render(ev){
+    var comp   = ev.competitions[0];
+    var away   = comp.competitors.find(function(c){return c.homeAway === "away";}) || comp.competitors[1];
+    var home   = comp.competitors.find(function(c){return c.homeAway === "home";}) || comp.competitors[0];
+    var status = ev.status || {};
+    var type   = status.type || {};
+    var state  = type.state;
+    var sit    = comp.situation || {};
+
+    document.documentElement.style.setProperty("--away", field(away.team));
+    document.documentElement.style.setProperty("--home", field(home.team));
+
+    var hasBall = sit.possession != null ? String(sit.possession) : null;
+    var pre     = state === "pre";
+    var post    = state === "post";
+
+    function sideHTML(c, cls){
+      var t   = c.team || {};
+      var rec = (c.records && c.records[0] && c.records[0].summary) || "";
+      var ball = hasBall && String(t.id) === hasBall;
+      var dim  = post && Number(c.score) < Number(cls === "away" ? home.score : away.score);
+      return '<div class="side ' + cls + (dim ? " dark" : "") + '">' +
+               (t.logo ? '<img class="crest" src="' + esc(t.logo) + '" alt="">' : "") +
+               '<div class="abbr">' + esc(t.abbreviation || t.shortDisplayName || "") + '</div>' +
+               (rec ? '<div class="record">' + esc(rec) + '</div>' : "") +
+               '<div class="score">' + (pre ? "&ndash;" : esc(c.score)) + '</div>' +
+               '<div class="rail' + (ball ? " on" : "") + '"></div>' +
+             '</div>';
+    }
+
+    // situation line
+    var left = "", right = "";
+    if(pre){
+      var d = new Date(ev.date);
+      left  = esc(ev.shortName || "");
+      right = d.toLocaleTimeString([], {hour:"numeric", minute:"2-digit"});
+    } else if(post){
+      left  = "Final";
+      right = esc(type.shortDetail || "");
+    } else {
+      // Only football has a down, a quarter, and a running clock. Baseball, soccer
+      // and everything else describe themselves fine in shortDetail ("End 7th").
+      var clocked = /football/.test(LEAGUE) && status.displayClock && status.displayClock !== "0:00";
+      left  = esc(sit.downDistanceText || "");
+      right = clocked
+        ? '<span class="q">Q' + esc(status.period) + '</span>' + esc(status.displayClock)
+        : esc(type.shortDetail || type.detail || "");
+    }
+
+    var lastPlay = (sit.lastPlay && sit.lastPlay.text) ? sit.lastPlay.text : "";
+    // Don't echo the status line back as a "last play".
+    var flat = String(left + right).replace(/<[^>]*>/g,"").toLowerCase();
+    if(flat.indexOf(lastPlay.toLowerCase().slice(0,12)) !== -1) lastPlay = "";
+    var redzone  = sit.isRedZone ? " redzone" : "";
+
+    app.innerHTML =
+      '<div class="field">' + sideHTML(away,"away") + '<div class="divider"></div>' + sideHTML(home,"home") + '</div>' +
+      '<div class="band' + redzone + '">' +
+        '<div class="row"><div class="situation">' + left + '</div><div class="clock">' + right + '</div></div>' +
+        (lastPlay ? '<div class="lastplay">' + esc(lastPlay) + '</div>' : "") +
+      '</div>';
+
+    pulse.className = "pulse" + (state === "in" ? " live" : "");
+    return state;
+  }
+
+  function message(head, sub){
+    app.innerHTML = '<div class="msg"><h1>' + esc(head) + '</h1>' +
+                    (sub ? '<p>' + esc(sub) + '</p>' : "") + '</div>';
+    pulse.className = "pulse";
+  }
+
+  function tick(){
+    fetch(API, {cache:"no-store"})
+      .then(function(r){
+        if(!r.ok) throw new Error("HTTP " + r.status);
+        return r.json();
+      })
+      .then(function(data){
+        var ev = pickGame(data.events);
+        var state = ev ? render(ev) : (message("No " + TEAM + " game today", "This screen wakes up on gameday."), null);
+        schedule(state === "in" ? 20000 : 300000);
+      })
+      .catch(function(){
+        message("Can't reach scores", "Retrying in 30 seconds. Check the car's connection.");
+        schedule(30000);
+      });
+  }
+
+  function schedule(ms){
+    clearTimeout(timer);
+    timer = setTimeout(tick, ms);
+  }
+
+  document.addEventListener("visibilitychange", function(){
+    if(!document.hidden) tick();
+  });
+
+  message("Loading", TEAM);
+  tick();
+})();
+</script>
+</body>
+</html>
