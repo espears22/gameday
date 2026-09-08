@@ -86,3 +86,77 @@ Do not build these even if they seem easy:
 
 Plain HTML, CSS, vanilla JS in one file. No framework, no build step, no dependencies.
 It has to load fast over a car's cellular connection. Keep it that way.
+
+## Fantasy overlay — spec
+
+Ships after Week 1 validates. Do not build before the score screen has rendered against
+a live NFL game and been tuned against a real Tesla screenshot.
+
+### Scope: Sleeper only
+
+ESPN and Yahoo are explicitly out, and this is a cost decision rather than a preference:
+
+- ESPN needs `SWID` and `espn_s2` session cookies lifted from the user's own browser.
+  Asking strangers to paste session credentials into the site is a trust problem, and
+  the flow breaks whenever ESPN rotates anything.
+- Yahoo needs OAuth — client secrets, token storage, refresh handling. That requires a
+  backend, which introduces per-user cost and kills the unlimited free tier that is the
+  product's main advantage over anything TesLyr-shaped.
+
+Sleeper's read endpoints need no auth at all, so the overlay stays a static file.
+Revisit only if real users ask.
+
+### Data flow
+
+Base: `https://api.sleeper.app/v1` — read-only, no key.
+
+1. `GET /state/nfl` → current `week`. Never hardcode the week.
+2. `GET /user/{username}` → `user_id`
+3. `GET /user/{user_id}/leagues/nfl/{season}` → league list
+4. `GET /league/{league_id}/rosters` → match `owner_id` to `user_id` → `roster_id`
+5. `GET /league/{league_id}/matchups/{week}` → each entry has `roster_id`, `matchup_id`,
+   and `points` (already computed against that league's scoring settings). The two
+   entries sharing a `matchup_id` are the head-to-head pair.
+
+Cache steps 2–4 in memory for the session. Only step 5 needs re-polling.
+
+### Config
+
+Extends the existing URL-param pattern. No storage, no accounts:
+
+```
+?team=IND&sleeper=evanspears&league_id=123456789
+```
+
+`league_id` optional — default to the first NFL league for the current season. Include
+it so people in multiple leagues can bookmark each one separately.
+
+### Display
+
+Add a third band below the existing situation band. Two names, two totals, same
+tabular-figure treatment as the game score, roughly two-thirds its size.
+
+```
+Me   87.4        Kyle   62.1
+```
+
+Do not render a per-player roster breakdown. Nine players with individual scores is not
+readable at a glance, and glanceability is the entire product. It also isn't cheaply
+available: Sleeper's full players file is very large and their docs say not to fetch it
+more than once a day, so player-ID-to-name mapping can't happen on page load. The
+matchup endpoint gives team totals, which is the number that actually matters mid-drive.
+
+Highlight whichever side is ahead. That's the glanceable signal, same role the
+possession rail plays above it.
+
+### Failure behaviour
+
+The fantasy band is strictly additive. If the `sleeper` param is missing, the username
+doesn't resolve, or the API fails, render the score screen exactly as it is today with
+no band and no error. A fantasy failure must never degrade the score screen. That screen
+is the product; this is an attachment to it.
+
+### Polling
+
+30s while a game is live, 5 minutes otherwise. Sleeper has no published rate limit,
+which is a reason for restraint rather than a license.
