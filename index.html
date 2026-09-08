@@ -108,7 +108,19 @@
     font-size:clamp(24px,min(4.4vh,3.5vw),37px);color:var(--dim);font-weight:500;
     line-height:1.25;max-height:2.5em;overflow:hidden;
   }
+  .lastplay.alert{
+    font-size:clamp(28px,min(5.6vh,4.4vw),46px);
+    color:var(--live);font-weight:700;
+  }
   .redzone .situation{color:#FF5A4E;}
+
+  /* ---- Fantasy totals: secondary to the alert, small and quiet ---- */
+  .totals{
+    display:flex;justify-content:space-between;gap:1.5em;
+    font-size:clamp(18px,min(3.2vh,2.6vw),28px);
+    font-weight:600;color:var(--dim);
+  }
+  .totals .lead{color:var(--live);}
 
   /* ---- States ---- */
   .msg{
@@ -145,9 +157,32 @@
   var LEAGUE  = (qs.get("league") || "football/nfl").replace(/^\/|\/$/g,"");
   var API     = "https://site.api.espn.com/apis/site/v2/sports/" + LEAGUE + "/scoreboard";
 
+  // ---- optional fantasy alerts: ?sleeper=evanspears&league_id=123 ------
+  var SLEEPER_USER  = qs.get("sleeper") || null;
+  var LEAGUE_ID_QS  = qs.get("league_id") || null;
+  var SLEEPER_API   = "https://api.sleeper.app/v1";
+  var PLAYERS_URL   = "players.json";
+
   var app   = document.getElementById("app");
   var pulse = document.getElementById("pulse");
   var timer = null;
+  var fantasyTimer = null;
+  var lastEv    = null;   // most recent event, for forcing a redraw when an alert decays
+  var liveState = null;   // mirrors the score screen's live/pre/post state, for fantasy polling
+
+  var fantasy = {
+    ready: false,
+    rosterMap: {},      // player_id -> {name, team, pos}, only players on the user's roster
+    ownerByRoster: {},  // roster_id -> owner_id, for labeling the opponent
+    ownerNames: {},     // user_id -> display_name
+    leagueId: null,
+    rosterId: null,
+    week: null,
+    meLabel: "Me",
+    totals: null,        // {me, opp, oppLabel}
+    alert: null,          // {text, until}
+    lastSeenPlayText: ""
+  };
 
   function esc(s){
     return String(s == null ? "" : s).replace(/[&<>"]/g, function(c){
@@ -174,6 +209,129 @@
     return "rgb(" + Math.round(parseInt(hex.slice(0,2),16)*k) + "," +
                     Math.round(parseInt(hex.slice(2,4),16)*k) + "," +
                     Math.round(parseInt(hex.slice(4,6),16)*k) + ")";
+  }
+
+  // ---- fantasy: name normalization + matching --------------------------
+  // ESPN writes plays as prose, Sleeper stores structured names. Normalize hard
+  // (casefold, strip punctuation/suffixes) and match on last name + first
+  // initial. A false positive is worse than a miss, so ambiguous -> nothing.
+  function normalizeName(s){
+    return String(s || "")
+      .toLowerCase()
+      .replace(/'/g, "")
+      .replace(/\./g, " ")  // "J.Taylor" -> "j taylor", not "jtaylor" (would eat the word boundary)
+      .replace(/\b(jr|sr|ii|iii|iv)\b/g, "")
+      .replace(/[^a-z0-9\s]/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
+  function matchFantasyPlay(text, awayAbbr, homeAbbr){
+    if(!fantasy.ready || !text) return null;
+    var norm = normalizeName(text);
+    var candidates = [];
+    for(var pid in fantasy.rosterMap){
+      var p = fantasy.rosterMap[pid];
+      if(p.team === awayAbbr || p.team === homeAbbr) candidates.push(p);
+    }
+    var hits = candidates.filter(function(p){
+      var parts = normalizeName(p.name).split(" ");
+      var last  = parts[parts.length - 1];
+      if(!last) return false;
+      var escLast = last.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      if(!(new RegExp("\\b" + escLast + "\\b")).test(norm)) return false;
+      // If a single-letter initial sits immediately before the last name (e.g.
+      // "j taylor", from "J.Taylor"), it must match this candidate's initial —
+      // a *contradicting* initial is a hard reject, not a weaker signal. No
+      // adjacent initial at all falls back to last name + team scope.
+      var initMatch = norm.match(new RegExp("\\b([a-z])\\s+" + escLast + "\\b"));
+      var first = parts[0];
+      if(initMatch && first) return initMatch[1] === first.charAt(0);
+      return true;
+    });
+    if(hits.length === 1){
+      console.debug("[fantasy] matched", hits[0].name, "in:", text);
+      return hits[0];
+    }
+    console.debug(hits.length > 1
+      ? "[fantasy] ambiguous, showing nothing: " + text
+      : "[fantasy] no match: " + text);
+    return null;
+  }
+
+  // ---- fantasy: session setup (cached) + matchup polling ---------------
+  function setupFantasy(){
+    fetch(SLEEPER_API + "/state/nfl")
+      .then(function(r){ return r.json(); })
+      .then(function(state){
+        fantasy.week = state.week;
+        return fetch(SLEEPER_API + "/user/" + encodeURIComponent(SLEEPER_USER))
+          .then(function(r){ return r.json(); })
+          .then(function(user){
+            if(!user || !user.user_id) throw new Error("no such sleeper user");
+            return fetch(SLEEPER_API + "/user/" + user.user_id + "/leagues/nfl/" + state.season)
+              .then(function(r){ return r.json(); })
+              .then(function(leagues){
+                leagues = leagues || [];
+                var league = LEAGUE_ID_QS
+                  ? leagues.find(function(l){ return l.league_id === LEAGUE_ID_QS; })
+                  : leagues[0];
+                if(!league) throw new Error("no matching sleeper league");
+                fantasy.leagueId = league.league_id;
+                return Promise.all([
+                  fetch(SLEEPER_API + "/league/" + fantasy.leagueId + "/rosters").then(function(r){ return r.json(); }),
+                  fetch(SLEEPER_API + "/league/" + fantasy.leagueId + "/users").then(function(r){ return r.json(); }),
+                  fetch(PLAYERS_URL).then(function(r){ return r.json(); })
+                ]).then(function(results){
+                  var rosters     = results[0] || [];
+                  var users       = results[1] || [];
+                  var playersData = results[2] || {};
+                  var mine = rosters.find(function(r){ return r.owner_id === user.user_id; });
+                  if(!mine) throw new Error("no roster for this user in league");
+                  fantasy.rosterId = mine.roster_id;
+                  (mine.players || []).forEach(function(pid){
+                    if(playersData[pid]) fantasy.rosterMap[pid] = playersData[pid];
+                  });
+                  rosters.forEach(function(r){ fantasy.ownerByRoster[r.roster_id] = r.owner_id; });
+                  users.forEach(function(u){ fantasy.ownerNames[u.user_id] = u.display_name || "Opponent"; });
+                  fantasy.ready = true;
+                  pollFantasy();
+                });
+              });
+          });
+      })
+      .catch(function(err){
+        console.debug("[fantasy] setup failed, running without it:", err && err.message);
+      });
+  }
+
+  function pollFantasy(){
+    if(!fantasy.ready) return;
+    fetch(SLEEPER_API + "/league/" + fantasy.leagueId + "/matchups/" + fantasy.week)
+      .then(function(r){ return r.json(); })
+      .then(function(matchups){
+        matchups = matchups || [];
+        var mine = matchups.find(function(m){ return m.roster_id === fantasy.rosterId; });
+        var opp  = mine && matchups.find(function(m){
+          return m.matchup_id === mine.matchup_id && m.roster_id !== fantasy.rosterId;
+        });
+        if(mine && opp){
+          var oppOwnerId = fantasy.ownerByRoster[opp.roster_id];
+          fantasy.totals = {
+            me: Number(mine.points) || 0,
+            opp: Number(opp.points) || 0,
+            oppLabel: fantasy.ownerNames[oppOwnerId] || "Opponent"
+          };
+          if(lastEv) render(lastEv);
+        }
+      })
+      .catch(function(err){
+        console.debug("[fantasy] matchup poll failed:", err && err.message);
+      })
+      .then(function(){
+        clearTimeout(fantasyTimer);
+        fantasyTimer = setTimeout(pollFantasy, liveState === "in" ? 30000 : 300000);
+      });
   }
 
   function pickGame(events){
@@ -244,17 +402,46 @@
         : esc(type.shortDetail || type.detail || "");
     }
 
-    var lastPlay = (sit.lastPlay && sit.lastPlay.text) ? sit.lastPlay.text : "";
-    // Don't echo the status line back as a "last play".
-    var flat = String(left + right).replace(/<[^>]*>/g,"").toLowerCase();
-    if(flat.indexOf(lastPlay.toLowerCase().slice(0,12)) !== -1) lastPlay = "";
-    var redzone  = sit.isRedZone ? " redzone" : "";
+    var rawLastPlay = (sit.lastPlay && sit.lastPlay.text) ? sit.lastPlay.text : "";
+    var redzone     = sit.isRedZone ? " redzone" : "";
+
+    // A genuinely new play: check it against the user's roster. Re-rendering the
+    // same play (e.g. when a fantasy poll forces a redraw) must not re-trigger it.
+    if(rawLastPlay && rawLastPlay !== fantasy.lastSeenPlayText){
+      fantasy.lastSeenPlayText = rawLastPlay;
+      var hit = matchFantasyPlay(rawLastPlay, away.team && away.team.abbreviation, home.team && home.team.abbreviation);
+      if(hit){
+        fantasy.alert = {text: hit.name.toUpperCase() + "  " + rawLastPlay, until: Date.now() + 20000};
+        setTimeout(function(){ if(lastEv) render(lastEv); }, 20000);
+      }
+    }
+
+    var alertActive = fantasy.alert && Date.now() < fantasy.alert.until;
+    var lastPlayHTML;
+    if(alertActive){
+      lastPlayHTML = '<div class="lastplay alert">' + esc(fantasy.alert.text) + '</div>';
+    } else {
+      fantasy.alert = null;
+      // Don't echo the status line back as a "last play".
+      var flat = String(left + right).replace(/<[^>]*>/g,"").toLowerCase();
+      var displayPlay = flat.indexOf(rawLastPlay.toLowerCase().slice(0,12)) !== -1 ? "" : rawLastPlay;
+      lastPlayHTML = displayPlay ? '<div class="lastplay">' + esc(displayPlay) + '</div>' : "";
+    }
+
+    var totalsHTML = "";
+    if(fantasy.totals){
+      var meLead = fantasy.totals.me >= fantasy.totals.opp;
+      totalsHTML = '<div class="totals">' +
+        '<span class="' + (meLead ? "lead" : "") + '">' + esc(fantasy.meLabel) + " " + fantasy.totals.me.toFixed(1) + '</span>' +
+        '<span class="' + (meLead ? "" : "lead") + '">' + esc(fantasy.totals.oppLabel) + " " + fantasy.totals.opp.toFixed(1) + '</span>' +
+      '</div>';
+    }
 
     app.innerHTML =
       '<div class="field">' + sideHTML(away,"away") + '<div class="divider"></div>' + sideHTML(home,"home") + '</div>' +
       '<div class="band' + redzone + '">' +
         '<div class="row"><div class="situation">' + left + '</div><div class="clock">' + right + '</div></div>' +
-        (lastPlay ? '<div class="lastplay">' + esc(lastPlay) + '</div>' : "") +
+        lastPlayHTML + totalsHTML +
       '</div>';
 
     pulse.className = "pulse" + (state === "in" ? " live" : "");
@@ -275,8 +462,14 @@
       })
       .then(function(data){
         var ev = pickGame(data.events);
-        var state = ev ? render(ev) : (message("No " + TEAM + " game today", "This screen wakes up on gameday."), null);
-        schedule(state === "in" ? 20000 : 300000);
+        if(ev){
+          lastEv = ev;
+          liveState = render(ev);
+        } else {
+          liveState = null;
+          message("No " + TEAM + " game today", "This screen wakes up on gameday.");
+        }
+        schedule(liveState === "in" ? 20000 : 300000);
       })
       .catch(function(){
         message("Can't reach scores", "Retrying in 30 seconds. Check the car's connection.");
@@ -295,6 +488,7 @@
 
   message("Loading", TEAM);
   tick();
+  if(SLEEPER_USER) setupFantasy();
 })();
 </script>
 </body>

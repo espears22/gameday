@@ -87,38 +87,86 @@ Do not build these even if they seem easy:
 Plain HTML, CSS, vanilla JS in one file. No framework, no build step, no dependencies.
 It has to load fast over a car's cellular connection. Keep it that way.
 
-## Fantasy overlay — spec
+## Fantasy play alerts — spec
 
-Ships after Week 1 validates. Do not build before the score screen has rendered against
-a live NFL game and been tuned against a real Tesla screenshot.
+Ships after Week 1 validates. Do not start before the score screen has rendered
+against a live NFL game and been tuned to a real Tesla screenshot.
+
+Superseded the earlier team-totals-only "Fantasy overlay" spec — this version
+adds the play-level alert, which is the actual point of the feature.
+
+### The feature
+
+Not a fantasy scoreboard. A **play-level alert**.
+
+ESPN's `situation.lastPlay.text` names the players involved in the play that just
+happened. The user's Sleeper roster is a list of player IDs. Intersect them:
+
+    JONATHAN TAYLOR  14 YD TD          +7.2
+
+When a play involves someone on the user's roster, surface it. Otherwise show
+nothing extra. This is the one feature in this product that a bookmark to ESPN
+cannot replace, and it's the reason someone opens this instead of anything else.
+
+Team totals ("Me 87.4 — Kyle 62.1") are secondary. Show them small in the band.
+The alert is the product.
 
 ### Scope: Sleeper only
 
-ESPN and Yahoo are explicitly out, and this is a cost decision rather than a preference:
+ESPN fantasy needs `SWID` / `espn_s2` session cookies lifted from the user's own
+browser — a trust problem and permanently fragile. Yahoo needs OAuth, which means
+secrets, token storage, and a backend, which introduces per-user cost and kills
+the unlimited free tier. Sleeper's reads need no auth, so the app stays static.
 
-- ESPN needs `SWID` and `espn_s2` session cookies lifted from the user's own browser.
-  Asking strangers to paste session credentials into the site is a trust problem, and
-  the flow breaks whenever ESPN rotates anything.
-- Yahoo needs OAuth — client secrets, token storage, refresh handling. That requires a
-  backend, which introduces per-user cost and kills the unlimited free tier that is the
-  product's main advantage over anything TesLyr-shaped.
-
-Sleeper's read endpoints need no auth at all, so the overlay stays a static file.
 Revisit only if real users ask.
+
+**Survivor / Pick'em is out.** Sleeper runs those products but exposes no
+documented endpoints for them. If an undocumented one turns up in the network tab,
+treat it as a bonus, never a dependency.
+
+**Sports betting is out.** Not buildable (books don't expose user positions to
+third parties), regulated per-state, and wrong for a screen whose whole value is
+being trustworthy at a glance.
 
 ### Data flow
 
-Base: `https://api.sleeper.app/v1` — read-only, no key.
+Base: `https://api.sleeper.app/v1` — read-only, no key. Stay well under 1000
+calls/min; they IP-block.
 
-1. `GET /state/nfl` → current `week`. Never hardcode the week.
+Session setup, cached in memory after first load:
+
+1. `GET /state/nfl` → current `week`. Never hardcode it.
 2. `GET /user/{username}` → `user_id`
 3. `GET /user/{user_id}/leagues/nfl/{season}` → league list
-4. `GET /league/{league_id}/rosters` → match `owner_id` to `user_id` → `roster_id`
-5. `GET /league/{league_id}/matchups/{week}` → each entry has `roster_id`, `matchup_id`,
-   and `points` (already computed against that league's scoring settings). The two
-   entries sharing a `matchup_id` are the head-to-head pair.
+4. `GET /league/{league_id}/rosters` → match `owner_id` to `user_id` to get
+   `roster_id` and the user's `players` array
+5. `GET /league/{league_id}/matchups/{week}` → entries carry `roster_id`,
+   `matchup_id`, and `points` already computed against that league's scoring
+   settings. The two entries sharing a `matchup_id` are the head-to-head pair.
 
-Cache steps 2–4 in memory for the session. Only step 5 needs re-polling.
+Only step 5 re-polls.
+
+### Player name mapping — build step, not runtime
+
+The full `/players/nfl` dump is ~5MB and Sleeper says not to fetch it more than
+once a day. Never call it from the browser.
+
+Instead, generate a trimmed static `players.json` at build time using the filters
+(`?position=QB&active=true`, and so on for RB/WR/TE/K/DEF). Keep only `player_id`,
+full name, and team. Commit it. Refresh weekly.
+
+### Name matching is the hard part — treat it as such
+
+ESPN writes plays as prose; Sleeper stores structured names. They will not match
+cleanly. Normalize aggressively: casefold, strip punctuation and suffixes
+(Jr., III), and match on last name plus first initial plus NFL team.
+
+**A false positive is worse than a miss.** Telling someone their player scored
+when he didn't destroys the only thing this product sells, which is being right at
+a glance. When the match is ambiguous, show nothing.
+
+Log unmatched plays during Weeks 1 and 2 and tune against real data rather than
+guessing at the rules up front.
 
 ### Config
 
@@ -128,35 +176,26 @@ Extends the existing URL-param pattern. No storage, no accounts:
 ?team=IND&sleeper=evanspears&league_id=123456789
 ```
 
-`league_id` optional — default to the first NFL league for the current season. Include
-it so people in multiple leagues can bookmark each one separately.
+`league_id` optional — default to the first NFL league of the current season.
+Include it so people in several leagues can bookmark each separately.
 
 ### Display
 
-Add a third band below the existing situation band. Two names, two totals, same
-tabular-figure treatment as the game score, roughly two-thirds its size.
-
-```
-Me   87.4        Kyle   62.1
-```
-
-Do not render a per-player roster breakdown. Nine players with individual scores is not
-readable at a glance, and glanceability is the entire product. It also isn't cheaply
-available: Sleeper's full players file is very large and their docs say not to fetch it
-more than once a day, so player-ID-to-name mapping can't happen on page load. The
-matchup endpoint gives team totals, which is the number that actually matters mid-drive.
-
-Highlight whichever side is ahead. That's the glanceable signal, same role the
-possession rail plays above it.
+- **Alert:** replaces the last-play line when a rostered player is involved.
+  Larger than the normal last-play text, held for ~20s, then decays back.
+  One line. Never a list.
+- **Totals:** small, in the band, alongside the game situation. Highlight
+  whichever side leads.
+- Do **not** render a per-player roster breakdown. Nine players with individual
+  scores is not glanceable, and glanceable is the entire product.
 
 ### Failure behaviour
 
-The fantasy band is strictly additive. If the `sleeper` param is missing, the username
-doesn't resolve, or the API fails, render the score screen exactly as it is today with
-no band and no error. A fantasy failure must never degrade the score screen. That screen
-is the product; this is an attachment to it.
+Strictly additive. If the `sleeper` param is missing, the username doesn't
+resolve, or Sleeper is down: render the score screen exactly as it is today, with
+no band, no alert, and no error message. **A fantasy failure must never degrade
+the score screen.** That screen is the product; this attaches to it.
 
 ### Polling
 
-30s while a game is live, 5 minutes otherwise. Sleeper has no published rate limit,
-which is a reason for restraint rather than a license.
+30s while a game is live, 5 minutes otherwise.
